@@ -33,6 +33,12 @@ from habitat_sim.utils.common import quat_from_angle_axis
 from habitat_sim.utils.namespace import hsim_physics
 from habitat_sim.utils.settings import default_sim_settings, make_cfg
 
+
+def _sim_sensors(sim: habitat_sim.Simulator):
+    sensors = getattr(sim, "sensors", None)
+    return sensors if sensors is not None else sim._sensors
+
+
 # file holding all URDF filenames
 URDF_FILES = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "urdfFileNames.txt"
@@ -55,6 +61,7 @@ class HabitatSimInteractiveViewer(Application):
     # font size of the magnum in-window display text that displays
     # CPU and GPU usage info
     DISPLAY_FONT_SIZE = 16.0
+    MAX_DISPLAY_TEXT_CHARS = 512
 
     def __init__(self, sim_settings: Dict[str, Any]) -> None:
         self.sim_settings: Dict[str:Any] = sim_settings
@@ -70,12 +77,10 @@ class HabitatSimInteractiveViewer(Application):
             self.sim_settings["window_height"],
         )
 
-        Application.__init__(
-            self,
-            self.Configuration(
-                title="Habitat Sim Interactive Viewer", size=window_size
-            ),
-        )
+        configuration = self.Configuration()
+        configuration.title = "Habitat Sim Interactive Viewer"
+        configuration.size = window_size
+        Application.__init__(self, configuration)
         self.fps: float = 60.0
 
         # Compute environment camera resolution based on the number of environments to render in the window.
@@ -108,6 +113,7 @@ class HabitatSimInteractiveViewer(Application):
             key.X: "move_down",
             key.Z: "move_up",
         }
+        self.pressed = {key: False for key in self.key_to_action}
 
         # Load a TrueTypeFont plugin and open the font file
         self.display_font = text.FontManager().load_and_instantiate("TrueTypeFont")
@@ -118,7 +124,9 @@ class HabitatSimInteractiveViewer(Application):
         )
 
         # Glyphs we need to render everything
-        self.glyph_cache = text.GlyphCacheGL(mn.PixelFormat.R8_UNORM, mn.Vector2i(256))
+        self.glyph_cache = text.GlyphCacheGL(
+            mn.PixelFormat.R8_UNORM, mn.Vector2i(256), mn.Vector2i(1)
+        )
         self.display_font.fill_glyph_cache(
             self.glyph_cache,
             string.ascii_lowercase
@@ -128,8 +136,13 @@ class HabitatSimInteractiveViewer(Application):
         )
 
         # magnum text object that displays CPU/GPU usage data in the app window
-        self.window_text = text.RendererGL(self.glyph_cache)
-        self.window_text.alignment = text.Alignment.TOP_LEFT
+        self.window_text = text.Renderer2D(
+            self.display_font,
+            self.glyph_cache,
+            HabitatSimInteractiveViewer.DISPLAY_FONT_SIZE,
+            text.Alignment.TOP_LEFT,
+        )
+        self.window_text.reserve(HabitatSimInteractiveViewer.MAX_DISPLAY_TEXT_CHARS)
 
         # text object transform in window space is Projection matrix times Translation Matrix
         # put text in top left of window
@@ -501,7 +514,7 @@ class HabitatSimInteractiveViewer(Application):
         if self.enable_batch_renderer:
             self.render_batch()
         else:
-            self.sim.sensors[keys[1]].draw_observation()
+            _sim_sensors(self.sim)[keys[1]].draw_observation()
             agent = self.sim.get_agent(keys[0])
             self.render_camera = agent.scene_node.node_sensor_suite.get(keys[1])
             self.debug_draw()
@@ -659,7 +672,7 @@ class HabitatSimInteractiveViewer(Application):
             keyframe = self.tiled_sims[i].gfx_replay_manager.extract_keyframe()
             self.replay_renderer.set_environment_keyframe(i, keyframe)
             # Copy sensor transforms
-            sensor_suite = self.tiled_sims[i].sensors
+            sensor_suite = _sim_sensors(self.tiled_sims[i])
             for sensor_uuid, sensor in sensor_suite.items():
                 transform = sensor.node.absolute_transformation()
                 self.replay_renderer.set_sensor_transform(i, sensor_uuid, transform)
@@ -676,9 +689,9 @@ class HabitatSimInteractiveViewer(Application):
             return
 
         agent = self.sim.agents[self.agent_id]
-        act: Dict[Application.Key, str] = self.key_to_action
-
-        action_queue: List[str] = [v for k, v in act.items() if self.is_key_pressed(k)]
+        action_queue: List[str] = [
+            self.key_to_action[key] for key, pressed in self.pressed.items() if pressed
+        ]
 
         for _ in range(int(repetitions)):
             [agent.act(x) for x in action_queue]
@@ -825,6 +838,9 @@ class HabitatSimInteractiveViewer(Application):
                 self.ao_link_map = hsim_physics.get_ao_link_id_map(self.sim)
                 self.markersets_util.update_markersets()
 
+        if key in self.pressed:
+            self.pressed[key] = True
+
         event.accepted = True
         self.redraw()
 
@@ -834,6 +850,11 @@ class HabitatSimInteractiveViewer(Application):
         is part of the movement keys map `Dict[KeyEvent.key, Bool]`, then the key will
         be set to False for the next `self.move_and_look()` to update the current actions.
         """
+
+        key = event.key
+
+        if key in self.pressed:
+            self.pressed[key] = False
 
         event.accepted = True
         self.redraw()
@@ -1062,10 +1083,7 @@ class HabitatSimInteractiveViewer(Application):
         elif self.mouse_interaction == MouseMode.MARKER:
             mouse_mode_string = "MARKER"
         edit_string = self.obj_editor.edit_disp_str()
-        self.window_text.clear()  # replace all previous text
         self.window_text.render(
-            self.display_font.create_shaper(),
-            self.display_font.size,
             f"""
 {self.fps} FPS
 Sensor Type: {sensor_type_string}

@@ -42,6 +42,12 @@ from habitat_sim.utils.common import quat_from_angle_axis
 from habitat_sim.utils.namespace import hsim_physics
 from habitat_sim.utils.settings import default_sim_settings, make_cfg
 
+
+def _sim_sensors(sim: habitat_sim.Simulator):
+    sensors = getattr(sim, "sensors", None)
+    return sensors if sensors is not None else sim._sensors
+
+
 # add tools directory so I can import things to try them in the viewer
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tools"))
 # print(sys.path)
@@ -891,7 +897,7 @@ class HabitatSimInteractiveViewer(Application):
         if self.enable_batch_renderer:
             self.render_batch()
         else:
-            self.sim.sensors[keys[1]].draw_observation()
+            _sim_sensors(self.sim)[keys[1]].draw_observation()
             agent = self.sim.get_agent(keys[0])
             self.render_camera = agent.scene_node.node_sensor_suite.get(keys[1])
             self.debug_draw()
@@ -1055,7 +1061,7 @@ class HabitatSimInteractiveViewer(Application):
             keyframe = self.tiled_sims[i].gfx_replay_manager.extract_keyframe()
             self.replay_renderer.set_environment_keyframe(i, keyframe)
             # Copy sensor transforms
-            sensor_suite = self.tiled_sims[i].sensors
+            sensor_suite = _sim_sensors(self.tiled_sims[i])
             for sensor_uuid, sensor in sensor_suite.items():
                 transform = sensor.node.absolute_transformation()
                 self.replay_renderer.set_sensor_transform(i, sensor_uuid, transform)
