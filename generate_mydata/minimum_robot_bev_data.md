@@ -35,7 +35,7 @@ map_classes:
   - carpet
   - obstacle
   - wall
-  - threshold
+  - other
   - unknown
 ```
 

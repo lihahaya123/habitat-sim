@@ -1,0 +1,26 @@
+{
+  "train": [
+    "apartment_0",
+    "apartment_1",
+    "frl_apartment_0",
+    "frl_apartment_1",
+    "frl_apartment_2",
+    "frl_apartment_3",
+    "hotel_0",
+    "office_0",
+    "office_2",
+    "office_3",
+    "room_0",
+    "room_2",
+    "room_1",
+    "frl_apartment_4"
+  ],
+  "val": [
+    "apartment_2",
+    "office_1"
+  ],
+  "test": [
+    "frl_apartment_5",
+    "office_4"
+  ]
+}
