@@ -756,8 +756,16 @@ def point_indices(
     x = points[:, 0]
     y = points[:, 1]
     valid = (x >= x_min) & (x < x_max) & (y >= y_min) & (y < y_max)
-    rows = ((x[valid] - x_min) / x_step).astype(np.int64)
-    cols = ((y[valid] - y_min) / y_step).astype(np.int64)
+    height = int(round((x_max - x_min) / x_step))
+    width = int(round((y_max - y_min) / y_step))
+    rows = np.floor((x[valid] - x_min) / x_step).astype(np.int64)
+    cols = np.floor((y[valid] - y_min) / y_step).astype(np.int64)
+    # A float32 value just below the upper bound can round to exactly
+    # height/width after division (for example 1.4999999 -> column 150).
+    # The continuous bounds check above establishes that the point belongs to
+    # the final cell, so clamp only this numerical boundary artifact.
+    rows = np.clip(rows, 0, height - 1)
+    cols = np.clip(cols, 0, width - 1)
     return rows, cols
 
 
@@ -807,8 +815,10 @@ def mark_observed_rays(
         )
         if not np.any(inside):
             continue
-        rows = ((samples[inside, 0] - x_min) / x_step).astype(np.int64)
-        cols = ((samples[inside, 1] - y_min) / y_step).astype(np.int64)
+        rows = np.floor((samples[inside, 0] - x_min) / x_step).astype(np.int64)
+        cols = np.floor((samples[inside, 1] - y_min) / y_step).astype(np.int64)
+        rows = np.clip(rows, 0, valid_mask.shape[0] - 1)
+        cols = np.clip(cols, 0, valid_mask.shape[1] - 1)
         valid_mask[rows, cols] = 1
 
 
@@ -830,16 +840,24 @@ def build_navmesh_topdown(
 
 
 def sample_navmesh_topdown(cache: NavmeshTopdown, world: np.ndarray) -> np.ndarray:
-    cols = ((world[:, 0] - cache.min_x) / cache.meters_per_pixel).astype(np.int64)
-    rows = ((world[:, 2] - cache.min_z) / cache.meters_per_pixel).astype(np.int64)
+    # Promote before subtracting the lower bound. In float32, a coordinate just
+    # below the upper bound can lose that distinction during subtraction.
+    world64 = np.asarray(world, dtype=np.float64)
+    x_offset = world64[:, 0] - cache.min_x
+    z_offset = world64[:, 2] - cache.min_z
     inside = (
-        (rows >= 0)
-        & (rows < cache.grid.shape[0])
-        & (cols >= 0)
-        & (cols < cache.grid.shape[1])
+        (z_offset >= 0.0)
+        & (z_offset < cache.grid.shape[0] * cache.meters_per_pixel)
+        & (x_offset >= 0.0)
+        & (x_offset < cache.grid.shape[1] * cache.meters_per_pixel)
     )
     values = np.zeros(world.shape[0], dtype=np.uint8)
-    values[inside] = cache.grid[rows[inside], cols[inside]]
+    if np.any(inside):
+        rows = np.floor(z_offset[inside] / cache.meters_per_pixel).astype(np.int64)
+        cols = np.floor(x_offset[inside] / cache.meters_per_pixel).astype(np.int64)
+        rows = np.clip(rows, 0, cache.grid.shape[0] - 1)
+        cols = np.clip(cols, 0, cache.grid.shape[1] - 1)
+        values[inside] = cache.grid[rows, cols]
     return values
 
 

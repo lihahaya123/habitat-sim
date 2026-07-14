@@ -13,6 +13,48 @@ from generate_mydata import robot_bev_closed_loop as generator
 
 
 class ReplicaGeneratorGeometryTest(unittest.TestCase):
+    def test_point_indices_handle_upper_boundary_float32_roundoff(self):
+        y = np.nextafter(np.float32(1.5), np.float32(-np.inf))
+        points = np.array([[1.0, y, 0.0]], dtype=np.float32)
+
+        rows, cols = generator.point_indices(
+            points,
+            (0.0, 3.0, 0.02),
+            (-1.5, 1.5, 0.02),
+        )
+
+        np.testing.assert_array_equal(rows, [50])
+        np.testing.assert_array_equal(cols, [149])
+
+    def test_observed_rays_handle_upper_boundary_float32_roundoff(self):
+        valid = np.zeros((150, 150), dtype=np.uint8)
+        y = np.nextafter(np.float32(1.5), np.float32(-np.inf))
+        points = np.array([[1.0, y, 0.0]], dtype=np.float32)
+
+        generator.mark_observed_rays(
+            valid,
+            points,
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            (0.0, 3.0, 0.02),
+            (-1.5, 1.5, 0.02),
+        )
+
+        self.assertEqual(valid[50, 149], 1)
+
+    def test_navmesh_topdown_handles_upper_boundary_float32_roundoff(self):
+        cache = generator.NavmeshTopdown(
+            grid=np.ones((150, 150), dtype=np.uint8),
+            min_x=-1.5,
+            min_z=0.0,
+            meters_per_pixel=0.02,
+        )
+        x = np.nextafter(np.float32(1.5), np.float32(-np.inf))
+        world = np.array([[x, 0.0, 1.0]], dtype=np.float32)
+
+        sampled = generator.sample_navmesh_topdown(cache, world)
+
+        np.testing.assert_array_equal(sampled, [1])
+
     def test_disabled_stair_filter_accepts_navmesh_random_point(self):
         class Pathfinder:
             @staticmethod
