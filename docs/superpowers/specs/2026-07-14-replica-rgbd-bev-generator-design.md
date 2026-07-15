@@ -1,94 +1,119 @@
-# Replica RGB-D BEV 数据生成器设计
+# Replica RGB-D 观测域 BEV 数据生成器设计
 
 ## 目标
 
-在远程 NVIDIA 无头服务器上，使用 Habitat-Sim 0.2.2 的 PTex 渲染路径读取原始 Replica v1.0，生成可用于真实扫地机器人 BEV 模型预训练的数据。第一版模型输入为前视 RGB 和由同帧深度反投影得到的点云；未来可增加预测语义图输入分支。
+在远程 NVIDIA 无头服务器上，使用 Habitat-Sim 0.2.2 的 PTex 渲染路径读取原始 Replica v1.0，生成真实扫地机器人 BEV 模型的合成预训练数据。模型输入为同一时刻、同一前视针孔相机的 RGB 和深度反投影点云；监督输出为六个 multi-hot BEV 语义/几何通道，以及一个不由网络预测的观测有效 mask。
 
-本设计不支持 ReplicaCAD，也不修改 Habitat-Sim 渲染器本身。
+本设计不支持 ReplicaCAD，不修改 Habitat-Sim 渲染器，也不把场景全局信息或辅助视角扩展为模型的观测范围。
 
 ## 运行环境
 
 - Python 3.8。
 - Habitat-Sim 0.2.2，headless/EGL 构建。
-- 原始 Replica v1.0 数据，包含 `mesh.ply`、`textures/*-color-ptex.hdr`、`habitat/sorted_faces.bin`、语义网格和 navmesh。
-- NVIDIA GPU，显存能够容纳目标场景的全部 PTex atlas。
-- 生成脚本保存在当前仓库，但必须兼容 Habitat-Sim 0.2.2 Python API。
+- 原始 Replica v1.0，包含 PTex、语义网格、`info_semantic.json` 和 navmesh。
+- NVIDIA GPU 显存能够容纳目标场景全部 PTex atlas。
+- 生成器必须拒绝 Habitat-Sim 0.3.x 的 PTex 回退路径。
 
-## 范围
+## 数据契约
 
-生成器负责：
+每帧训练数据包含：
 
-- 加载单个或多个 Replica 场景；
-- 渲染前视 RGB、深度和实例语义；
-- 将输入深度反投影为 `[x, y, z, intensity, time]` float32 点云；
-- 独立生成局部 BEV multi-hot 真值；
-- 生成连续闭环轨迹、时间戳、标定、位姿和历史 sweeps；
-- 保存训练所需文件、可选可视化、元数据和质量汇总；
-- 支持按场景划分 train/val/test；
-- 支持断点续跑，并拒绝静默覆盖参数不一致的数据。
+- 前视 RGB：`uint8 [H,W,3]`；
+- 前视 Z-depth：毫米制 `uint16 [H,W]`，0 表示无效；
+- 前视实例语义：`uint16 [H,W]`；
+- 伪 LiDAR：float32 `[N,5]`，列为 `[x,y,z,intensity,time]`，后两列第一版填 0；
+- BEV 标签：`uint8 [6,H_bev,W_bev]`；
+- BEV 有效 mask：`uint8 [H_bev,W_bev]`。
 
-生成器不负责：
+RGB、深度和语义共享相机位置、朝向、分辨率、HFOV 和帧时刻。点云、BEV 和标定统一使用机器人 base 坐标：`x` 向前、`y` 向左、`z` 向上。
 
-- ReplicaCAD 或其他场景数据集；
-- 刚体、关节物体或 Bullet 交互；
-- 真实 ToF 噪声的最终标定；
-- 模型训练代码；
-- PTex 到 GLB 的转换。
+## 六个可学习通道
 
-## 数据集发现与校验
+通道顺序固定为：
 
-CLI 接受 `--dataset-root`，默认在根目录查找 `replica.scene_dataset_config.json`。场景可以通过 `--scene`、`--scenes` 或 `--scenes-file` 指定。
+1. `floor`：观测有效区域内，按照机器人 navmesh 判定可通行的地面；
+2. `carpet`：Replica 中的 `carpet`、`rug`、`mat`；
+3. `obstacle`：有效深度点中，高度位于障碍阈值区间的几何端点；
+4. `wall`：Replica 的 `wall` 实例；
+5. `furniture`：床、桌、椅、柜、沙发、架子等明确家具实例；
+6. `other`：其他有可靠实例类别、但不属于上述语义组的物体。
 
-每个场景启动前必须检查：
+标签是 multi-hot，不使用 softmax。例如桌子格同时允许 `furniture=1` 和 `obstacle=1`，地毯格同时允许 `floor=1` 和 `carpet=1`。
 
-- `mesh.ply`；
-- `textures/parameters.json`；
-- 至少一个 `textures/*-color-ptex.hdr`；
-- `habitat/sorted_faces.bin`；
-- `habitat/mesh_semantic.ply`；
-- `habitat/info_semantic.json`；
-- 可加载的 navmesh，或允许重新计算 navmesh。
+`unknown` 不再占据可学习通道。它由 `1 - bev_valid_mask` 确定；在无效区域，六个标签通道必须全部为 0。
 
-缺少 PTex 文件时必须失败，不能退回 PLY 顶点色，以免把水面状 RGB 混入正式训练集。
+## 家具映射
 
-## 坐标系和传感器
+第一版家具集合固定为：
 
-训练输出统一使用机器人 base 坐标系：
+```text
+base-cabinet, beanbag, bed, bench, cabinet, chair, desk,
+nightstand, plant-stand, rack, shelf, sofa, stool, table,
+tv-stand, wall-cabinet
+```
 
-- `x` 向前；
-- `y` 向左；
-- `z` 向上。
+类别名称统一把 `_` 和 `-` 归一为空格后做精确匹配。`wall-plug` 不能因包含 `wall` 而误映射为墙；`undefined`、`unknown`、`void`、`background` 和 `none` 不生成语义标签；其余已知类别进入 `other`。
 
-前视 RGB、深度和实例语义传感器共享分辨率、HFOV、位置和俯仰角。相机参数全部由 CLI 指定，并写入元数据和标定文件。
+## 观测有效 mask
 
-输入点云严格从当前帧前视深度反投影，保持真实部署时的视场、遮挡和盲区。点格式固定为 float32 `[x, y, z, intensity, time]`，第一版后两维填零。
+`bev_valid_masks` 只表达当前模型输入传感器真实覆盖的区域：
 
-## BEV 真值
+```text
+valid = 前视 RGB-D 有效深度射线覆盖
+        ∪ 未来独立 LiDAR 有效射线覆盖
+```
 
-输入点云与 BEV 真值必须解耦。输入只来自前视 RGB-D；真值由 Habitat 的完整场景几何、实例语义和 navmesh 生成，不把前视可见点直接当作完整标签。
+当前版本没有独立 LiDAR，`.bin` 点云由前视深度产生，因此有效 mask 与前视伪 LiDAR共享同一批深度点。RGB 本身没有可用于 BEV 遮挡终点的距离；“RGB视角覆盖”必须通过对齐的有效深度射线落实。
 
-第一版输出六个 multi-hot 通道：
+mask 初始化为全 0。每条射线只标记传感器原点到有效返回点之间的格子；没有深度、超量程和返回点之后的区域保持 0。实现可按水平角度合并同方向射线并保留最远有效返回，以高效得到所有射线在 BEV 平面的覆盖并集。
 
-1. `floor`：navmesh 可通行区域和语义地面；
-2. `carpet`：`carpet`、`rug`、`mat` 等地面软材质；
-3. `obstacle`：高于地面阈值的占据几何；
-4. `wall`：语义墙面及几何边界；
-5. `other`：已识别但不属于 floor/carpet/wall 的语义实例；
-6. `unknown`：不在有效真值覆盖内或无法确定的格子。
+NavMesh 只能生成 `floor` 标签，不得把相机视角之外的全局可通行区域加入 valid mask。左、后、右辅助 GT 相机不得参与正式标签或 valid mask。
 
-通道是 multi-hot，而不是互斥单标签。`other` 可以与 `obstacle` 重叠。例如桌子既是已知的 `other` 实例，也占据 `obstacle` 通道。`unknown` 只在没有有效已知标签时置一。
+## 标签生成流程
 
-同时输出一个有效性/可观测性 mask，供训练忽略没有可靠真值的格子。该 mask 不占用六个语义通道。
+每帧只进行一次前视深度反投影，同时返回点云和对应实例 ID：
 
-## 轨迹和数据划分
+1. 从前视深度、内参和 Habitat 实际 `sensor_state` 得到 base 坐标点；
+2. 保存同一批点的 `[x,y,z,0,0]` 为模型伪 LiDAR 输入；
+3. 从这些点的射线生成 `valid_mask`；
+4. 将 BEV 网格中心变换到世界坐标，查询 navmesh，并与 `valid_mask` 相交生成 `floor`；
+5. 按点高生成 `obstacle`；
+6. 按实例 ID 生成 `carpet/wall/furniture/other`；
+7. 用 `valid_mask[None]` 最终裁剪全部六个通道。
 
-轨迹由安全 navmesh 点开始，使用接近扫地机器人的小步长和平滑转向。发生碰撞、台阶风险或不可导航状态时回退并转向。保存真值 `T_map_base`，为以后增加带噪 odometry 留出字段。
+这种流程确保训练输入、几何端点、语义端点和 loss 有效区域来自完全相同的前视观测。
 
-数据划分以场景或完整轨迹为单位。任何一条轨迹的帧不得同时出现在 train 和 val/test 中。CLI 接受显式场景列表文件，生产运行不再使用“同一轨迹前段训练、尾段验证”的旧逻辑。
+## 可视化与训练
 
-## 输出协议
+`visualizations/bev_labels/*.png` 使用下列 RGB 颜色（不是 OpenCV BGR）：
 
-每个场景输出：
+| 通道 | 类别 | RGB | 十六进制 | 含义 |
+|---:|---|---:|---:|---|
+| 0 | `floor` | `(160, 160, 160)` | `#A0A0A0` | 可通行地面，浅灰色 |
+| 1 | `carpet` | `(70, 130, 180)` | `#4682B4` | 地毯、地垫，钢蓝色 |
+| 2 | `obstacle` | `(220, 50, 47)` | `#DC322F` | 几何障碍物，红色 |
+| 3 | `wall` | `(90, 90, 90)` | `#5A5A5A` | 墙体，深灰色 |
+| 4 | `furniture` | `(147, 112, 219)` | `#9370DB` | 家具，紫色 |
+| 5 | `other` | `(255, 190, 60)` | `#FFBE3C` | 其他已知语义物体，黄橙色 |
+| — | 无效/unknown | `(20, 20, 20)` | `#141414` | `valid_mask=0` 的未观测区域，近黑色；不是第七个类别 |
+
+因为 BEV 标签是 multi-hot，同一格可以同时属于多类，而 PNG 只能显示一种颜色。可视化按 `floor < carpet < wall < other < furniture < obstacle` 的覆盖优先级绘制：越靠右优先级越高，例如同时为 `furniture` 和 `obstacle` 的格最终显示红色。最后强制将 `valid_mask=0` 覆盖为近黑色。PNG 仅供人工检查，训练必须读取 `bev_masks/*.npy` 和 `bev_valid_masks/*.npy`。
+
+训练时网络输出 `[B,6,H,W]` logits，单通道 mask 广播到六个通道：
+
+```python
+raw = focal_loss(logits, target, reduction="none")
+valid = bev_valid_mask[:, None].float()
+loss = (raw * valid).sum() / (valid.sum() * 6).clamp_min(1.0)
+```
+
+推理系统可对外封装六个 sigmoid 概率和一个外部 mask；unknown 始终由 `1-valid` 派生。
+
+## 轨迹、划分与输出
+
+轨迹从安全 navmesh 点开始，使用机器人小步长和平滑转向。发生碰撞或可选台阶检查失败时回退并转向。保存真值 `T_map_base` 和历史 sweeps。
+
+train/val/test 必须按场景划分，同一轨迹帧不得泄漏到不同 split。每个场景输出：
 
 ```text
 <output>/<scene>/
@@ -106,57 +131,26 @@ CLI 接受 `--dataset-root`，默认在根目录查找 `replica.scene_dataset_co
   manifest.jsonl
 ```
 
-根目录根据显式 split 文件生成合并后的：
+根目录输出合并后的 `robot_infos_{train,val,test}.pkl` 和 `multi_scene_summary.json`。
 
-```text
-robot_infos_train.pkl
-robot_infos_val.pkl
-robot_infos_test.pkl
-multi_scene_summary.json
-```
+## Schema 与断点续跑
 
-`manifest.jsonl` 每成功完成一帧追加一条原子记录，用于断点续跑。`info.pkl` 在场景完成后由 manifest 构建，避免中途崩溃留下看似完整的索引。
+新协议使用 `generator_schema_version=3`。生成 fingerprint 必须包含 schema 版本、六类顺序和语义映射配置，而不只包含 CLI 参数。
 
-## 断点续跑和失败处理
+Schema v2 的 `unknown` 标签和“NavMesh + 四方向 GT” valid mask 与 v3 不兼容。新脚本必须拒绝在 v2 输出目录上 `--resume`，避免一个 manifest 中混合两种标签。生产数据应使用新输出目录；旧 RGB/深度/语义可由独立迁移工具离线重标，但迁移不属于本次脚本改动。
 
-- 首次运行把完整 CLI 参数、版本、场景配置哈希写入 `metadata.json`。
-- `--resume` 只允许在元数据一致时继续。
-- 每帧先写临时文件，全部成功后原子重命名并追加 manifest。
-- PTex 加载失败、GPU device lost、语义缺失、空深度或 navmesh 无效均记录明确错误并使该场景失败。
-- 多场景模式允许记录失败场景后继续，但最终退出码必须非零，并在汇总中列出失败原因。
-- 默认不静默回退到无语义或顶点色模式。
+## 质量与测试
 
-## 质量检查
+单元测试必须覆盖：
 
-每个场景汇总至少包含：
+- 相机内参、外参、深度反投影和 BEV 边界；
+- 家具、墙、地毯、其他和忽略类别映射；
+- NavMesh 不扩大 valid mask；
+- 深度射线产生 valid mask；
+- valid 外六通道全部为 0；
+- `furniture + obstacle` multi-hot；
+- 可视化无效区域为黑色；
+- schema/fingerprint 阻止旧数据续跑；
+- sweep 位姿、split、manifest 和原子输出回归。
 
-- 帧数、轨迹长度和碰撞/回退次数；
-- RGB 非空及动态范围；
-- 深度有效像素比例、最小值、最大值；
-- 点云点数统计；
-- 语义有效像素比例和实例映射数量；
-- 六个 BEV 通道及 valid mask 的覆盖率；
-- navmesh 面积；
-- PTex atlas 数量和磁盘大小；
-- Habitat-Sim、Python、GPU 和数据配置版本。
-
-若任一正式类别在整个训练 split 中覆盖率为零，生成器必须在最终汇总中报错，而不是仅打印警告。
-
-## 测试策略
-
-纯 Python 单元测试覆盖：
-
-- 相机内参与坐标变换；
-- 深度反投影；
-- 语义类别映射；
-- BEV 网格索引、multi-hot 和 valid mask；
-- sweep 相对位姿；
-- 场景级 split 无泄漏；
-- manifest 断点续跑和元数据不一致拒绝逻辑。
-
-Habitat 集成测试分两级：
-
-1. 本地小场景 smoke test：`office_1`，2 至 10 帧；
-2. 远程生产测试：`office_1` 后运行 `apartment_0`，检查 PTex、RGB/Depth/Semantic 对齐、显存和输出完整性。
-
-集成测试必须从日志确认 `Loading PTEX asset`，并验证输出 RGB 不是 PLY 顶点色回退结果。
+Habitat 集成测试先用 `office_1` 生成 1 至 10 帧，验证两个 `.npy` 的形状和 dtype、valid 外标签为 0、家具通道非空以及 RGB/Depth/Semantic 对齐；远程正式运行再覆盖全部 Replica 场景。

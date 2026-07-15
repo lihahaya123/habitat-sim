@@ -35,13 +35,15 @@ import habitat_sim
 from habitat_sim.utils.common import quat_from_angle_axis, quat_from_coeffs, quat_to_coeffs
 
 
+GENERATOR_SCHEMA_VERSION = 3
+
 MAP_CLASSES = [
     "floor",
     "carpet",
     "obstacle",
     "wall",
+    "furniture",
     "other",
-    "unknown",
 ]
 
 BEV_CLASS_COLORS = {
@@ -49,42 +51,57 @@ BEV_CLASS_COLORS = {
     "carpet": (70, 130, 180),
     "obstacle": (220, 50, 47),
     "wall": (90, 90, 90),
+    "furniture": (147, 112, 219),
     "other": (255, 190, 60),
-    "unknown": (20, 20, 20),
 }
 
+BEV_INVALID_COLOR = (20, 20, 20)
+
 BEV_VIS_PRIORITY = [
-    "unknown",
     "floor",
     "carpet",
     "wall",
     "other",
+    "furniture",
     "obstacle",
 ]
 
-SEMANTIC_KEYWORD_RULES = {
-    "carpet": ["carpet", "rug", "mat"],
-    "wall": ["wall"],
-    "floor": ["floor", "ground"],
+FURNITURE_CATEGORIES = frozenset(
+    {
+        "base cabinet",
+        "beanbag",
+        "bed",
+        "bench",
+        "cabinet",
+        "chair",
+        "desk",
+        "nightstand",
+        "plant stand",
+        "rack",
+        "shelf",
+        "sofa",
+        "stool",
+        "table",
+        "tv stand",
+        "wall cabinet",
+    }
+)
+
+SEMANTIC_CATEGORY_GROUPS = {
+    "carpet": frozenset({"carpet", "floor mat", "mat", "rug"}),
+    "wall": frozenset({"wall"}),
+    "floor": frozenset({"floor", "ground"}),
+    "furniture": FURNITURE_CATEGORIES,
 }
+
+IGNORED_SEMANTIC_CATEGORIES = frozenset(
+    {"", "background", "none", "undefined", "unknown", "void"}
+)
 
 RGB_UUID = "front_rgb"
 DEPTH_UUID = "front_depth"
 SEMANTIC_UUID = "front_semantic"
 FRL_PTEX_ASSET_TYPE = 3  # esp::assets::AssetType::FRL_PTEX_MESH in Habitat-Sim 0.2.2
-GT_SENSOR_YAWS_DEG = {
-    "left": 90.0,
-    "back": 180.0,
-    "right": -90.0,
-}
-
-
-def gt_depth_uuid(direction: str) -> str:
-    return f"gt_{direction}_depth"
-
-
-def gt_semantic_uuid(direction: str) -> str:
-    return f"gt_{direction}_semantic"
 
 
 @dataclass(frozen=True)
@@ -383,36 +400,6 @@ def make_cfg(args: argparse.Namespace) -> habitat_sim.Configuration:
         semantic_spec.far = args.zfar
         sensor_specs.append(semantic_spec)
 
-    if args.gt_multiview:
-        for direction, yaw_deg in GT_SENSOR_YAWS_DEG.items():
-            # Keep auxiliary GT cameras level so their yaw is unambiguous across
-            # Habitat/Magnum Euler composition versions. Their exact returned
-            # sensor poses are still used for all depth backprojection.
-            orientation = mn.Vector3(0.0, math.radians(yaw_deg), 0.0)
-            gt_depth_spec = habitat_sim.CameraSensorSpec()
-            gt_depth_spec.uuid = gt_depth_uuid(direction)
-            gt_depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
-            gt_depth_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
-            gt_depth_spec.channels = 1
-            gt_depth_spec.resolution = mn.Vector2i([args.gt_height, args.gt_width])
-            gt_depth_spec.position = mn.Vector3(0.0, args.camera_height, 0.0)
-            gt_depth_spec.orientation = orientation
-            gt_depth_spec.hfov = mn.Deg(args.gt_hfov)
-            gt_depth_spec.far = args.zfar
-            sensor_specs.append(gt_depth_spec)
-
-            gt_semantic_spec = habitat_sim.CameraSensorSpec()
-            gt_semantic_spec.uuid = gt_semantic_uuid(direction)
-            gt_semantic_spec.sensor_type = habitat_sim.SensorType.SEMANTIC
-            gt_semantic_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
-            gt_semantic_spec.channels = 1
-            gt_semantic_spec.resolution = mn.Vector2i([args.gt_height, args.gt_width])
-            gt_semantic_spec.position = mn.Vector3(0.0, args.camera_height, 0.0)
-            gt_semantic_spec.orientation = orientation
-            gt_semantic_spec.hfov = mn.Deg(args.gt_hfov)
-            gt_semantic_spec.far = args.zfar
-            sensor_specs.append(gt_semantic_spec)
-
     agent_cfg = habitat_sim.AgentConfiguration()
     agent_cfg.height = args.agent_height
     agent_cfg.radius = args.agent_radius
@@ -698,25 +685,67 @@ def generation_fingerprint(args: argparse.Namespace, scene: str) -> str:
         if key not in excluded and isinstance(value, (str, int, float, bool, list, tuple, type(None)))
     }
     values["scene"] = scene
+    values["generator_schema_version"] = GENERATOR_SCHEMA_VERSION
+    values["map_classes"] = list(MAP_CLASSES)
+    values["semantic_category_groups"] = {
+        name: sorted(categories)
+        for name, categories in SEMANTIC_CATEGORY_GROUPS.items()
+    }
+    values["ignored_semantic_categories"] = sorted(IGNORED_SEMANTIC_CATEGORIES)
     encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def save_bev_label_vis(mask: np.ndarray, path: Path) -> None:
+def validate_resume_metadata(
+    previous_metadata: Dict[str, object],
+    fingerprint: str,
+    scene_split: str,
+    output_dir: Path,
+) -> None:
+    previous_schema = previous_metadata.get("generator_schema_version")
+    if previous_schema != GENERATOR_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"--resume schema mismatch for {output_dir}: existing schema "
+            f"{previous_schema!r}, required {GENERATOR_SCHEMA_VERSION}. Choose a new "
+            "output directory; schema-v2 and schema-v3 labels cannot be mixed."
+        )
+    if previous_metadata.get("fingerprint") != fingerprint:
+        raise RuntimeError(
+            f"--resume parameter mismatch for {output_dir}; existing fingerprint "
+            f"{previous_metadata.get('fingerprint')!r}, current {fingerprint!r}."
+        )
+    if previous_metadata.get("scene_split") != scene_split:
+        raise RuntimeError(
+            f"--resume split mismatch for {output_dir}: existing "
+            f"{previous_metadata.get('scene_split')!r}, current {scene_split!r}."
+        )
+
+
+def save_bev_label_vis(
+    mask: np.ndarray, valid_mask: np.ndarray, path: Path
+) -> None:
     height, width = mask.shape[1], mask.shape[2]
-    vis = np.zeros((height, width, 3), dtype=np.uint8)
+    valid_mask = np.asarray(valid_mask, dtype=np.uint8)
+    if valid_mask.shape != (height, width):
+        raise ValueError(
+            f"valid_mask must have shape {(height, width)}, found {valid_mask.shape}"
+        )
+    vis = np.full((height, width, 3), BEV_INVALID_COLOR, dtype=np.uint8)
     for class_name in BEV_VIS_PRIORITY:
         class_idx = MAP_CLASSES.index(class_name)
         vis[mask[class_idx] > 0] = BEV_CLASS_COLORS[class_name]
+    vis[valid_mask == 0] = BEV_INVALID_COLOR
     Image.fromarray(vis).save(path, format="PNG")
 
 
 def semantic_category_to_map_class(category_name: str) -> Optional[str]:
-    normalized = category_name.lower().replace("_", " ").replace("-", " ")
-    if not normalized or normalized in {"unknown", "void", "background", "none"}:
+    normalized = " ".join(
+        category_name.lower().replace("_", " ").replace("-", " ").split()
+    )
+    if normalized in IGNORED_SEMANTIC_CATEGORIES:
         return None
-    for map_class, keywords in SEMANTIC_KEYWORD_RULES.items():
-        if any(keyword in normalized for keyword in keywords):
+    for map_class, categories in SEMANTIC_CATEGORY_GROUPS.items():
+        if normalized in categories:
             return map_class
     return "other"
 
@@ -861,21 +890,48 @@ def sample_navmesh_topdown(cache: NavmeshTopdown, world: np.ndarray) -> np.ndarr
     return values
 
 
-def make_bev_mask(
+def make_observation_mask(
+    views: Sequence[Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]],
+    xbound: Tuple[float, float, float],
+    ybound: Tuple[float, float, float],
+) -> np.ndarray:
+    x_min, x_max, x_step = xbound
+    y_min, y_max, y_step = ybound
+    height = int(round((x_max - x_min) / x_step))
+    width = int(round((y_max - y_min) / y_step))
+    valid_mask = np.zeros((height, width), dtype=np.uint8)
+    for points, _, sensor_origin in views:
+        mark_observed_rays(
+            valid_mask,
+            points,
+            sensor_origin,
+            xbound,
+            ybound,
+        )
+    return valid_mask
+
+
+def make_bev_labels(
     sim: habitat_sim.Simulator,
     state: habitat_sim.AgentState,
-    gt_views: Sequence[Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]],
+    views: Sequence[Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]],
     semantic_id_to_class: Dict[int, str],
     xbound: Tuple[float, float, float],
     ybound: Tuple[float, float, float],
     min_obstacle_height: float,
     max_obstacle_height: float,
+    valid_mask: np.ndarray,
     navmesh_topdown: Optional[NavmeshTopdown] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     x_min, x_max, x_step = xbound
     y_min, y_max, y_step = ybound
     height = int(round((x_max - x_min) / x_step))
     width = int(round((y_max - y_min) / y_step))
+    valid_mask = np.asarray(valid_mask, dtype=np.uint8)
+    if valid_mask.shape != (height, width):
+        raise ValueError(
+            f"valid_mask must have shape {(height, width)}, found {valid_mask.shape}"
+        )
     mask = np.zeros((len(MAP_CLASSES), height, width), dtype=np.uint8)
 
     x_centers = x_min + (np.arange(height, dtype=np.float32) + 0.5) * x_step
@@ -890,11 +946,11 @@ def make_bev_mask(
         floor = np.zeros((height * width,), dtype=np.uint8)
         for idx, point in enumerate(world):
             floor[idx] = 1 if sim.pathfinder.is_navigable(point, max_y_delta=0.5) else 0
-    mask[MAP_CLASSES.index("floor")] = floor.reshape(height, width)
-    valid_mask = floor.reshape(height, width).copy()
+    mask[MAP_CLASSES.index("floor")] = (
+        floor.reshape(height, width).astype(bool) & valid_mask.astype(bool)
+    ).astype(np.uint8)
 
-    for points, semantic_ids, camera_origin in gt_views:
-        mark_observed_rays(valid_mask, points, camera_origin, xbound, ybound)
+    for points, semantic_ids, _ in views:
         if points.shape[0] == 0:
             continue
         obstacle_points = points[
@@ -912,7 +968,7 @@ def make_bev_mask(
             continue
         for semantic_id in np.unique(semantic_ids):
             map_class = semantic_id_to_class.get(int(semantic_id))
-            if map_class not in MAP_CLASSES or map_class in {"unknown", "obstacle"}:
+            if map_class not in MAP_CLASSES or map_class in {"floor", "obstacle"}:
                 continue
             semantic_points = points[semantic_ids == semantic_id]
             if semantic_points.shape[0] == 0:
@@ -920,8 +976,8 @@ def make_bev_mask(
             rows, cols = point_indices(semantic_points, xbound, ybound)
             mask[MAP_CLASSES.index(map_class), rows, cols] = 1
 
-    mask[MAP_CLASSES.index("unknown")] = np.logical_not(valid_mask).astype(np.uint8)
-    return mask, valid_mask
+    mask *= valid_mask[None]
+    return mask
 
 
 def write_calibration(
@@ -1022,9 +1078,13 @@ def build_infos(
 
     metadata = {
         "dataset": "robot_closed_loop",
+        "generator_schema_version": GENERATOR_SCHEMA_VERSION,
         "output_dir": output_dir.as_posix(),
         "map_classes": MAP_CLASSES,
         "bev_class_colors": BEV_CLASS_COLORS,
+        "bev_label_encoding": "six_channel_uint8_multihot",
+        "bev_valid_mask_source": "front_depth_ray_coverage",
+        "unknown_derivation": "1 - bev_valid_mask",
         "point_frame": "x_forward_y_left_z_up",
         "camera_frame": "opencv_optical_x_right_y_down_z_forward",
         "camera2base_convention": "T_base_camera_optical",
@@ -1071,7 +1131,7 @@ def save_metadata(
 ) -> None:
     metadata = {
         "generator": "original_replica_rgbd_bev",
-        "generator_schema_version": 2,
+        "generator_schema_version": GENERATOR_SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "habitat_sim_version": getattr(habitat_sim, "__version__", "unknown"),
         "python_version": sys.version.split()[0],
@@ -1084,13 +1144,21 @@ def save_metadata(
         "use_physics": args.use_physics,
         "map_classes": MAP_CLASSES,
         "bev_class_colors": BEV_CLASS_COLORS,
-        "semantic_keyword_rules": SEMANTIC_KEYWORD_RULES,
-        "bev_mask_generation": {
-            "floor": "navmesh navigability sampled at BEV grid centers",
-            "obstacle": "360-degree GT depth points filtered by height and projected to BEV",
-            "semantic": "360-degree instance semantics mapped to floor/carpet/wall/other",
-            "unknown": "cells outside navmesh or multi-view depth ray coverage",
+        "semantic_category_groups": {
+            name: sorted(categories)
+            for name, categories in SEMANTIC_CATEGORY_GROUPS.items()
         },
+        "ignored_semantic_categories": sorted(IGNORED_SEMANTIC_CATEGORIES),
+        "bev_mask_generation": {
+            "floor": "front-observed cells intersected with navmesh navigability",
+            "obstacle": "front depth points filtered by height and projected to BEV",
+            "semantic": "front instance semantics mapped to carpet/wall/furniture/other",
+        },
+        "bev_label_encoding": "six_channel_uint8_multihot",
+        "bev_valid_mask_source": "front_depth_ray_coverage",
+        "invalid_region_encoding": "all_six_labels_zero_and_external_mask_zero",
+        "unknown_derivation": "1 - bev_valid_mask; unknown is not a learned class",
+        "input_points_and_bev_labels_share_depth_samples": True,
         "xbound": list(xbound),
         "ybound": list(ybound),
         "camera_height": float(args.camera_height),
@@ -1112,8 +1180,6 @@ def save_metadata(
         "depth_format": "uint16_png_millimeters",
         "save_visualization": bool(args.save_visualization),
         "semantic_sensor": bool(args.semantic_sensor),
-        "gt_multiview": bool(args.gt_multiview),
-        "gt_sensor_yaws_deg": GT_SENSOR_YAWS_DEG if args.gt_multiview else {},
         "depth_model": "Habitat pinhole optical-axis Z depth in meters",
         "tof_note": "No ToF radial-range/noise model is applied; calibrate domain noise separately.",
     }
@@ -1239,16 +1305,12 @@ def generate(
         )
     if args.resume and metadata_path.exists():
         previous_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if previous_metadata.get("fingerprint") != fingerprint:
-            raise RuntimeError(
-                f"--resume parameter mismatch for {output_dir}; existing fingerprint "
-                f"{previous_metadata.get('fingerprint')!r}, current {fingerprint!r}."
-            )
-        if previous_metadata.get("scene_split") != scene_split:
-            raise RuntimeError(
-                f"--resume split mismatch for {args.scene}: existing "
-                f"{previous_metadata.get('scene_split')!r}, current {scene_split!r}."
-            )
+        validate_resume_metadata(
+            previous_metadata,
+            fingerprint,
+            scene_split,
+            output_dir,
+        )
     elif existing_manifest:
         raise RuntimeError(f"Manifest exists without compatible metadata: {output_dir}")
 
@@ -1258,7 +1320,6 @@ def generate(
             (output_dir / "visualizations" / name).mkdir(parents=True, exist_ok=True)
 
     intrinsic = make_camera_intrinsic(args.width, args.height, args.hfov)
-    gt_intrinsic = make_camera_intrinsic(args.gt_width, args.gt_height, args.gt_hfov)
     print(f"Dataset: {scene_files.dataset_config}")
     print(f"Scene: {args.scene} ({scene_split})")
     print(f"Output: {output_dir}")
@@ -1374,55 +1435,31 @@ def generate(
             atomic_save_png(semantic_obs.astype(np.uint16), semantic_path)
 
             front_extrinsic = sensor_to_base_matrix(state, DEPTH_UUID)
-            points, _ = depth_to_points(
+            points, front_semantic_ids = depth_to_points(
                 depth,
                 intrinsic,
                 front_extrinsic,
                 args.max_depth,
                 args.depth_stride,
                 args.max_points,
+                semantic_obs,
             )
             atomic_save_points(points, points_path)
 
-            front_gt_points, front_semantic_ids = depth_to_points(
-                depth,
-                intrinsic,
-                front_extrinsic,
-                args.max_depth,
-                args.gt_depth_stride,
-                args.gt_max_points_per_view,
-                semantic_obs,
-            )
-            gt_views: List[Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]] = [
-                (front_gt_points, front_semantic_ids, front_extrinsic[:3, 3])
+            views: List[Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]] = [
+                (points, front_semantic_ids, front_extrinsic[:3, 3])
             ]
-            if args.gt_multiview:
-                for direction in GT_SENSOR_YAWS_DEG:
-                    depth_uuid = gt_depth_uuid(direction)
-                    semantic_uuid = gt_semantic_uuid(direction)
-                    view_extrinsic = sensor_to_base_matrix(state, depth_uuid)
-                    view_points, view_semantic_ids = depth_to_points(
-                        np.asarray(obs[depth_uuid], dtype=np.float32),
-                        gt_intrinsic,
-                        view_extrinsic,
-                        args.max_depth,
-                        args.gt_depth_stride,
-                        args.gt_max_points_per_view,
-                        np.asarray(obs[semantic_uuid]),
-                    )
-                    gt_views.append(
-                        (view_points, view_semantic_ids, view_extrinsic[:3, 3])
-                    )
-
-            mask, valid_mask = make_bev_mask(
+            valid_mask = make_observation_mask(views, xbound, ybound)
+            mask = make_bev_labels(
                 sim,
                 state,
-                gt_views,
+                views,
                 semantic_id_to_class,
                 xbound,
                 ybound,
                 args.min_obstacle_height,
                 args.max_obstacle_height,
+                valid_mask,
                 navmesh_topdown,
             )
             atomic_save_npy(mask, bev_mask_path)
@@ -1433,7 +1470,12 @@ def generate(
                 save_depth_vis(depth, temp, args.max_depth)
                 temp.replace(depth_vis_path)
                 save_visualization_atomically(save_points_ply, ply_path, points)
-                save_visualization_atomically(save_bev_label_vis, bev_vis_path, mask)
+                save_visualization_atomically(
+                    save_bev_label_vis,
+                    bev_vis_path,
+                    mask,
+                    valid_mask,
+                )
 
             t_map_base = map_from_base_matrix(state)
             relative = lambda path: path.relative_to(output_dir).as_posix()
@@ -1618,6 +1660,7 @@ def generate_all(args: argparse.Namespace) -> None:
 
     metadata = {
         "dataset": "original_replica_rgbd_bev",
+        "generator_schema_version": GENERATOR_SCHEMA_VERSION,
         "habitat_sim_version": version,
         "scene_dataset_config_file": dataset_config.as_posix(),
         "output_dir": root_output_dir.as_posix(),
@@ -1626,6 +1669,9 @@ def generate_all(args: argparse.Namespace) -> None:
         "scene_splits": splits,
         "map_classes": MAP_CLASSES,
         "bev_class_colors": BEV_CLASS_COLORS,
+        "bev_label_encoding": "six_channel_uint8_multihot",
+        "bev_valid_mask_source": "front_depth_ray_coverage",
+        "unknown_derivation": "1 - bev_valid_mask",
         "point_frame": "x_forward_y_left_z_up",
         "camera_frame": "opencv_optical_x_right_y_down_z_forward",
         "map_frame": "habitat_world_x_right_y_up_z_back",
@@ -1721,13 +1767,6 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", type=float, default=4.0)
     parser.add_argument("--depth-stride", type=int, default=4)
     parser.add_argument("--max-points", type=int, default=20000)
-    parser.add_argument("--gt-width", type=int, default=320)
-    parser.add_argument("--gt-height", type=int, default=240)
-    parser.add_argument("--gt-hfov", type=float, default=100.0)
-    parser.add_argument("--gt-depth-stride", type=int, default=4)
-    parser.add_argument("--gt-max-points-per-view", type=int, default=20000)
-    parser.add_argument("--gt-multiview", dest="gt_multiview", action="store_true", default=True)
-    parser.add_argument("--disable-gt-multiview", dest="gt_multiview", action="store_false")
     parser.add_argument("--save-visualization", action="store_true")
     parser.add_argument("--save-ply", action="store_true", help=argparse.SUPPRESS)
 
@@ -1769,12 +1808,10 @@ def main() -> None:
         raise ValueError("--num-frames must be positive")
     if args.depth_stride <= 0:
         raise ValueError("--depth-stride must be positive")
-    if args.gt_depth_stride <= 0:
-        raise ValueError("--gt-depth-stride must be positive")
-    if min(args.width, args.height, args.gt_width, args.gt_height) <= 0:
-        raise ValueError("All sensor resolutions must be positive")
-    if not (0.0 < args.hfov < 180.0 and 0.0 < args.gt_hfov < 180.0):
-        raise ValueError("Camera HFOV values must be between 0 and 180 degrees")
+    if min(args.width, args.height) <= 0:
+        raise ValueError("Sensor resolution must be positive")
+    if not 0.0 < args.hfov < 180.0:
+        raise ValueError("Camera HFOV must be between 0 and 180 degrees")
     if args.agent_max_climb < 0:
         raise ValueError("--agent-max-climb must be non-negative")
     if args.agent_max_slope < 0:
@@ -1805,15 +1842,30 @@ if __name__ == "__main__":
 
 # conda activate habitat022
 
-# nohup env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
+
+# 单场景测试运行
+
 # python generate_mydata/robot_bev_closed_loop.py \
-#   --dataset "$DATASET" \
+#   --dataset /mnt/u/ubuntu/workspace/dataset/HIKVISION/replica/replica.scene_dataset_config.json \
+#   --scene office_1 \
+#   --output-dir data/robot_closed_loop/replica_observed_v3_smoke \
+#   --num-frames 10 \
+#   --num-sweeps 5 \
+#   --gpu-id 0 \
+#   --disable-physics \
+#   --recompute-navmesh \
+#   --save-visualization
+
+# 完整 Replica 数据集运行
+
+# PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
+# python generate_mydata/robot_bev_closed_loop.py \
+#   --dataset /mnt/u/ubuntu/workspace/dataset/HIKVISION/replica/replica.scene_dataset_config.json \
 #   --scenes-file generate_mydata/replica_scenes.txt \
 #   --split-file generate_mydata/replica_splits.example.json \
-#   --output-dir "$OUT" \
+#   --output-dir /mnt/e/work/HIKVISION/bevfusion/data/replica_observed_v3 \
 #   --num-frames 1000 \
 #   --num-sweeps 10 \
 #   --gpu-id 0 \
 #   --disable-physics \
-#   --recompute-navmesh \
-#   > "${OUT}.log" 2>&1 &
+#   --recompute-navmesh 

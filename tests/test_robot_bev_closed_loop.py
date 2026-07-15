@@ -3,9 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import habitat_sim
+from PIL import Image
 
 from habitat_sim.utils.common import quat_from_angle_axis
 
@@ -88,6 +90,22 @@ class ReplicaGeneratorGeometryTest(unittest.TestCase):
         self.assertEqual(args.agent_max_slope, 45.0)
         self.assertFalse(args.enable_stair_filter)
 
+    def test_default_config_uses_only_aligned_front_sensors(self):
+        args = generator.make_parser().parse_args(["--dataset", "replica.json"])
+        args.use_physics = False
+
+        self.assertFalse(hasattr(args, "gt_multiview"))
+        self.assertFalse(hasattr(args, "gt_width"))
+        cfg = generator.make_cfg(args)
+        sensor_uuids = [
+            spec.uuid for spec in cfg.agents[0].sensor_specifications
+        ]
+
+        self.assertEqual(
+            sensor_uuids,
+            [generator.RGB_UUID, generator.DEPTH_UUID, generator.SEMANTIC_UUID],
+        )
+
     def test_navmesh_settings_support_habitat_sim_022(self):
         class LegacyNavMeshSettings:
             def set_defaults(self):
@@ -141,12 +159,77 @@ class ReplicaGeneratorGeometryTest(unittest.TestCase):
         self.assertIsNone(semantic_ids)
         np.testing.assert_allclose(points[0, :3], [2.0, 0.0, 0.18], atol=1e-6)
 
+    def test_six_learned_map_classes_exclude_unknown(self):
+        self.assertEqual(
+            generator.MAP_CLASSES,
+            ["floor", "carpet", "obstacle", "wall", "furniture", "other"],
+        )
+
+    def test_semantic_furniture_and_ignored_category_mapping(self):
+        for category in ("chair", "table", "base-cabinet"):
+            self.assertEqual(
+                generator.semantic_category_to_map_class(category), "furniture"
+            )
+        self.assertEqual(generator.semantic_category_to_map_class("wall-plug"), "other")
+        self.assertIsNone(generator.semantic_category_to_map_class("undefined"))
+
     def test_semantic_fallback_is_other_not_obstacle(self):
-        self.assertEqual(generator.semantic_category_to_map_class("chair"), "other")
+        self.assertEqual(generator.semantic_category_to_map_class("bottle"), "other")
         self.assertEqual(generator.semantic_category_to_map_class("floor mat"), "carpet")
         self.assertEqual(generator.semantic_category_to_map_class("wall"), "wall")
 
-    def test_multihot_other_and_obstacle_share_a_cell(self):
+    def test_empty_observation_mask_stays_invalid(self):
+        make_observation_mask = getattr(generator, "make_observation_mask", None)
+        self.assertIsNotNone(make_observation_mask)
+
+        valid = make_observation_mask(
+            [],
+            (0.0, 2.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        )
+
+        self.assertEqual(valid.dtype, np.uint8)
+        self.assertEqual(valid.shape, (2, 2))
+        self.assertFalse(valid.any())
+
+    def test_navmesh_does_not_expand_observation_validity(self):
+        make_bev_labels = getattr(generator, "make_bev_labels", None)
+        self.assertIsNotNone(make_bev_labels)
+
+        class Pathfinder:
+            @staticmethod
+            def is_navigable(point, max_y_delta=0.5):
+                return True
+
+        class Simulator:
+            pathfinder = Pathfinder()
+
+        state = habitat_sim.AgentState()
+        state.position = np.zeros(3, dtype=np.float32)
+        state.rotation = quat_from_angle_axis(0.0, np.array([0.0, 1.0, 0.0]))
+        valid = np.zeros((2, 2), dtype=np.uint8)
+
+        mask = make_bev_labels(
+            Simulator(),
+            state,
+            [],
+            {},
+            (0.0, 2.0, 1.0),
+            (-1.0, 1.0, 1.0),
+            0.02,
+            0.8,
+            valid,
+        )
+
+        self.assertEqual(mask.shape, (6, 2, 2))
+        self.assertFalse(mask.any())
+
+    def test_multihot_furniture_and_obstacle_share_an_observed_cell(self):
+        make_observation_mask = getattr(generator, "make_observation_mask", None)
+        make_bev_labels = getattr(generator, "make_bev_labels", None)
+        self.assertIsNotNone(make_observation_mask)
+        self.assertIsNotNone(make_bev_labels)
+
         class Pathfinder:
             @staticmethod
             def is_navigable(point, max_y_delta=0.5):
@@ -159,22 +242,29 @@ class ReplicaGeneratorGeometryTest(unittest.TestCase):
         state.position = np.zeros(3, dtype=np.float32)
         state.rotation = quat_from_angle_axis(0.0, np.array([0.0, 1.0, 0.0]))
         points = np.array([[1.2, 0.0, 0.2, 0.0, 0.0]], dtype=np.float32)
-        mask, valid = generator.make_bev_mask(
+        views = [(points, np.array([5]), np.zeros(3, dtype=np.float32))]
+        valid = make_observation_mask(
+            views,
+            (0.0, 2.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        )
+        mask = make_bev_labels(
             Simulator(),
             state,
-            [(points, np.array([5]), np.zeros(3, dtype=np.float32))],
-            {5: "other"},
+            views,
+            {5: "furniture"},
             (0.0, 2.0, 1.0),
             (-1.0, 1.0, 1.0),
             0.02,
             0.8,
+            valid,
         )
 
         row, col = 1, 1
-        self.assertEqual(mask[generator.MAP_CLASSES.index("other"), row, col], 1)
+        self.assertEqual(mask[generator.MAP_CLASSES.index("furniture"), row, col], 1)
         self.assertEqual(mask[generator.MAP_CLASSES.index("obstacle"), row, col], 1)
         self.assertEqual(valid[row, col], 1)
-        self.assertEqual(mask[generator.MAP_CLASSES.index("unknown"), row, col], 0)
+        self.assertFalse(mask[:, valid == 0].any())
 
     def test_history_sweep_transforms_into_current_base(self):
         identity = np.eye(4, dtype=np.float32)
@@ -297,6 +387,38 @@ class ReplicaSplitTest(unittest.TestCase):
 
 
 class ReplicaManifestTest(unittest.TestCase):
+    def test_generation_fingerprint_includes_label_contract(self):
+        self.assertEqual(getattr(generator, "GENERATOR_SCHEMA_VERSION", None), 3)
+        args = generator.make_parser().parse_args(["--dataset", "replica.json"])
+        first = generator.generation_fingerprint(args, "office_1")
+
+        with mock.patch.object(
+            generator,
+            "MAP_CLASSES",
+            generator.MAP_CLASSES + ["temporary_contract_change"],
+        ):
+            second = generator.generation_fingerprint(args, "office_1")
+
+        self.assertNotEqual(first, second)
+
+    def test_resume_rejects_schema_v2_metadata(self):
+        validate_resume_metadata = getattr(
+            generator, "validate_resume_metadata", None
+        )
+        self.assertIsNotNone(validate_resume_metadata)
+
+        with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
+            validate_resume_metadata(
+                {
+                    "generator_schema_version": 2,
+                    "fingerprint": "same",
+                    "scene_split": "train",
+                },
+                "same",
+                "train",
+                Path("old-output"),
+            )
+
     def test_manifest_requires_contiguous_frame_indices(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.jsonl"
@@ -312,6 +434,25 @@ class ReplicaManifestTest(unittest.TestCase):
             generator.atomic_save_npy(expected, path)
             np.testing.assert_array_equal(np.load(path), expected)
             self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+    def test_bev_visualization_uses_external_mask_for_invalid_cells(self):
+        mask = np.zeros((6, 2, 2), dtype=np.uint8)
+        mask[generator.MAP_CLASSES.index("floor"), 0, 0] = 1
+        valid = np.zeros((2, 2), dtype=np.uint8)
+        valid[0, 0] = 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bev.png"
+            try:
+                generator.save_bev_label_vis(mask, valid, path)
+            except TypeError as exc:
+                self.fail(f"save_bev_label_vis must accept valid_mask: {exc}")
+            image = np.asarray(Image.open(path))
+
+        np.testing.assert_array_equal(
+            image[0, 0], generator.BEV_CLASS_COLORS["floor"]
+        )
+        np.testing.assert_array_equal(image[1, 1], generator.BEV_INVALID_COLOR)
 
 
 if __name__ == "__main__":
